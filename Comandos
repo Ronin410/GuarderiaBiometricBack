@@ -1,0 +1,11 @@
+# Probar en Virginia (us-east-1)
+aws rekognition list-collections --region us-east-1
+
+aws rekognition delete-collection --collection-id guarderia-2 --region us-east-1
+
+aws rekognition create-collection --collection-id guarderia-rostros --region us-east-1
+
+aws rekognition delete-faces --collection-id guarderia-rostros --face-ids "ID-DEL-ROSTRO" --region us-east-2
+
+
+aws rekognition list-faces --collection-id guarderia-rostros --region us-east-1

@@ -1,0 +1,100 @@
+CREATE TABLE padres (
+    id SERIAL PRIMARY KEY,
+    nombre VARCHAR(100) NOT NULL,
+    face_id VARCHAR(255) UNIQUE NOT NULL,
+    creado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE hijos (
+    id SERIAL PRIMARY KEY,
+    nombre_niño VARCHAR(100) NOT NULL,
+);
+
+alter table hijos drop column padre_id
+
+DROP TABLE tutor_hijos
+
+CREATE TABLE tutor_hijos (
+    padre_id INT REFERENCES padres(id),
+    hijo_id INT REFERENCES hijos(id),
+    PRIMARY KEY (padre_id, hijo_id)
+);
+
+INSERT INTO hijos (nombre_niño, padre_id) VALUES ('Alejandro Bueno', 1);
+
+INSERT INTO hijos (nombre_niño, padre_id) VALUES ('Sofía Bueno', 1);
+
+
+
+
+INSERT INTO asistencia (padre_id, accion) VALUES (1, 'ENTRADA')
+
+ALTER TABLE asistencia ADD COLUMN hijo_id INTEGER REFERENCES hijos(id);
+
+DROP TABLE IF EXISTS asistencia;
+
+CREATE TABLE asistencia (
+    id SERIAL PRIMARY KEY,
+    padre_id INTEGER NOT NULL,
+    hijo_id INTEGER NOT NULL,
+    fecha_hora TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    
+    -- Campos de bitácora que pide el Frontend
+    aseado BOOLEAN DEFAULT TRUE,
+    reporte_golpe BOOLEAN DEFAULT FALSE,
+    observaciones TEXT,
+    
+    -- Para diferenciar si es entrada o salida
+    tipo_movimiento VARCHAR(20) CHECK (tipo_movimiento IN ('ENTRADA', 'SALIDA', 'REGISTRO')),
+    
+    -- Relaciones (opcional, pero recomendado si tienes las tablas padres e hijos)
+    CONSTRAINT fk_padre FOREIGN KEY (padre_id) REFERENCES padres(id) ON DELETE CASCADE,
+    CONSTRAINT fk_hijo FOREIGN KEY (hijo_id) REFERENCES hijos(id) ON DELETE CASCADE
+);
+
+
+CREATE INDEX idx_asistencia_fecha ON asistencia(fecha_hora);
+
+
+
+SELECT p.id, p.nombre, n.id, n.nombre_niño
+			FROM padres p
+			JOIN tutor_hijos tn ON p.id = tn.padre_id
+			JOIN hijos n ON tn.hijo_id = n.id
+			WHERE p.face_id = '134ab113-71b1-49a6-8023-a4b3af384da4'
+
+
+INSERT INTO tutor_niño (padre_id, niño_id) VALUES (, $2) ON CONFLICT DO NOTHING
+
+
+SELECT 				a.id, 
+				p.nombre as padre_nombre, 
+				n.nombre_niño as hijo_nombre, 
+				a.fecha_hora, 
+				a.aseado, 
+				a.reporte_golpe, 
+				a.observaciones
+			FROM asistencia a
+			JOIN padres p ON a.padre_id = p.id
+			JOIN hijos n ON a.hijo_id = n.id
+			ORDER BY a.fecha_hora DESC
+			LIMIT 50
+
+
+			SELECT 
+            a.id, p.nombre, n.nombre_niño, a.fecha_hora, a.aseado, a.reporte_golpe, a.observaciones
+        FROM asistencia a
+        JOIN padres p ON a.padre_id = p.id
+        JOIN hijos n ON a.hijo_id = n.id
+        WHERE a.fecha_hora >= CURRENT_DATE 
+        ORDER BY a.fecha_hora DESC
+
+
+
+SELECT 
+            a.id, p.nombre, n.nombre_niño, a.fecha_hora, a.aseado, a.reporte_golpe, a.observaciones, a.tipo_movimiento
+        FROM asistencia a
+        JOIN padres p ON a.padre_id = p.id
+        JOIN hijos n ON a.hijo_id = n.id
+		WHERE a.fecha_hora::date = '2026-02-23'
+        ORDER BY a.fecha_hora DESC
