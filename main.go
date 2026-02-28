@@ -47,6 +47,7 @@ type Hijo struct {
 	ID           int    `json:"id"`
 	Nombre       string `json:"nombre"`
 	UltimoEstado string `json:"ultimo_estado"` // Nuevo campo
+	Activo       bool   `json:"activo"`
 }
 
 type RespuestaIdentificacion struct {
@@ -328,7 +329,7 @@ func main() {
             ), 'AUSENTE') -- Si no hay registros HOY, el niño está AUSENTE
         FROM padres p
         LEFT JOIN tutor_hijos tn ON p.id = tn.padre_id
-        LEFT JOIN hijos n ON tn.hijo_id = n.id
+        LEFT JOIN hijos n ON tn.hijo_id = n.id AND n.activo = true
         WHERE p.face_id = $1 AND p.guarderia_id = $2`
 
 		rows, err := db.Query(query, faceID, gID)
@@ -414,9 +415,9 @@ func main() {
 		// 3. Consulta con DOBLE FILTRO:
 		// Filtramos por padre_id Y por guarderia_id para asegurar que pertenezcan a la misma sede
 		query := `
-        SELECT h.id, h.nombre_niño 
+        SELECT h.id, h.nombre_niño, h.activo 
 		FROM hijos h
-		JOIN tutor_hijos th ON h.id = th.hijo_id
+		JOIN tutor_hijos th ON h.id = th.hijo_id 
 		WHERE th.padre_id = $1 AND th.guarderia_id = $2`
 
 		rows, err := db.Query(query, padreID, gID)
@@ -432,7 +433,7 @@ func main() {
 		for rows.Next() {
 			var h Hijo
 			// Solo escaneamos ID y Nombre según nuestro SELECT
-			if err := rows.Scan(&h.ID, &h.Nombre); err != nil {
+			if err := rows.Scan(&h.ID, &h.Nombre, &h.Activo); err != nil {
 				continue
 			}
 			listaHijos = append(listaHijos, h)
@@ -544,7 +545,8 @@ func main() {
 		query := `
         SELECT id, nombre_niño 
         FROM hijos 
-        WHERE nombre_niño ILIKE $1 AND guarderia_id = $2 
+        WHERE nombre_niño ILIKE $1 AND guarderia_id = $2
+		AND activo = true 
         LIMIT 5`
 
 		rows, err := db.Query(query, "%"+queryParam+"%", gID)
@@ -765,7 +767,7 @@ func main() {
         ORDER BY fecha_hora DESC
         LIMIT 1
     ) ult_mov ON true
-    WHERE h.guarderia_id = $1
+    WHERE h.guarderia_id = $1 AND h.activo = true
     ORDER BY h.nombre_niño ASC`
 
 		rows, err := db.Query(query, gID, fechaQuery)
@@ -899,6 +901,67 @@ func main() {
 			"valid":   true,
 			"message": "PIN confirmado",
 		})
+	})
+
+	r.PATCH("/hijos/:id/desactivar", AuthMiddleware(), func(c *gin.Context) {
+		gID, _ := c.Get("guarderia_id")
+		hijoID := c.Param("id")
+
+		// En lugar de DELETE, hacemos UPDATE del campo 'activo'
+		query := "UPDATE hijos SET activo = false WHERE id = $1 AND guarderia_id = $2"
+
+		result, err := db.Exec(query, hijoID, gID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Error al dar de baja"})
+			return
+		}
+
+		rows, _ := result.RowsAffected()
+		if rows == 0 {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Niño no encontrado"})
+			return
+		}
+
+		c.JSON(http.StatusOK, gin.H{"mensaje": "Alumno dado de baja correctamente"})
+	})
+
+	// --- EDITAR NOMBRE ---
+	r.PUT("/hijos/:id", AuthMiddleware(), func(c *gin.Context) {
+		gID, _ := c.Get("guarderia_id")
+		hijoID := c.Param("id") // --- EDITAR NOMBRE ---
+
+		var input struct {
+			Nombre string `json:"nombre"`
+		}
+		if err := c.ShouldBindJSON(&input); err != nil || input.Nombre == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Nombre es requerido"})
+			return
+		}
+
+		query := "UPDATE hijos SET nombre_niño = $1 WHERE id = $2 AND guarderia_id = $3"
+		_, err := db.Exec(query, input.Nombre, hijoID, gID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Error al actualizar"})
+			return
+		}
+
+		c.JSON(http.StatusOK, gin.H{"status": "Nombre actualizado"})
+	})
+
+	// --- REACTIVAR HIJO ---
+	r.PATCH("/hijos/:id/activar", AuthMiddleware(), func(c *gin.Context) {
+		gID, _ := c.Get("guarderia_id")
+		hijoID := c.Param("id")
+
+		query := "UPDATE hijos SET activo = true WHERE id = $1 AND guarderia_id = $2"
+
+		_, err := db.Exec(query, hijoID, gID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Error al reactivar"})
+			return
+		}
+
+		c.JSON(http.StatusOK, gin.H{"mensaje": "Alumno reactivado correctamente"})
 	})
 
 	r.Run(":8099")
