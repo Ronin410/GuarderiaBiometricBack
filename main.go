@@ -748,27 +748,27 @@ func main() {
 		// 2. Consulta SQL: Seleccionamos TODOS los niños (hijos)
 		// y buscamos su ÚLTIMO movimiento de asistencia en la fecha elegida
 		query := `
-    SELECT 
-        h.id, 
-        h.nombre_niño,
-        COALESCE(ult_mov.tipo_movimiento, 'AUSENTE') as estatus,
-        COALESCE(ult_mov.fecha_hora::text, '') as fecha_hora,
-        COALESCE(ult_mov.aseado, true) as aseado,
-        COALESCE(ult_mov.reporte_golpe, false) as reporte_golpe,
-        COALESCE(ult_mov.observaciones, '') as observaciones
-    FROM hijos h
-    LEFT JOIN LATERAL (
-        /* Esta subconsulta busca el registro más reciente del niño para ese día */
-        SELECT tipo_movimiento, fecha_hora, aseado, reporte_golpe, observaciones
-        FROM asistencia
-        WHERE hijo_id = h.id 
-          AND guarderia_id = $1 
-          AND fecha_hora::date = $2::date
-        ORDER BY fecha_hora DESC
-        LIMIT 1
-    ) ult_mov ON true
-    WHERE h.guarderia_id = $1 AND h.activo = true
-    ORDER BY h.nombre_niño ASC`
+		SELECT 
+			h.id, 
+			h.nombre_niño,
+			COALESCE(ult_mov.tipo_movimiento, 'AUSENTE') as estatus,
+			COALESCE(ult_mov.fecha_hora::text, '') as fecha_hora,
+			COALESCE(ult_mov.aseado, true) as aseado,
+			COALESCE(ult_mov.reporte_golpe, false) as reporte_golpe,
+			COALESCE(ult_mov.observaciones, '') as observaciones
+		FROM hijos h
+		LEFT JOIN LATERAL (
+			/* Esta subconsulta busca el registro más reciente del niño para ese día */
+			SELECT tipo_movimiento, fecha_hora, aseado, reporte_golpe, observaciones
+			FROM asistencia
+			WHERE hijo_id = h.id 
+			AND guarderia_id = $1 
+			AND fecha_hora::date = $2::date
+			ORDER BY fecha_hora DESC
+			LIMIT 1
+		) ult_mov ON true
+		WHERE h.guarderia_id = $1 AND h.activo = true
+		ORDER BY h.nombre_niño ASC`
 
 		rows, err := db.Query(query, gID, fechaQuery)
 		if err != nil {
@@ -820,21 +820,21 @@ func main() {
 
 		// 2. Consulta SQL con triple filtro: Rango de fechas Y Guardería
 		query := `
-        SELECT 
-            a.fecha_hora, 
-            h.nombre_niño, 
-            p.nombre as tutor_nombre, 
-            a.tipo_movimiento, 
-            a.aseado, 
-            a.reporte_golpe, 
-            COALESCE(a.observaciones, '')
-        FROM asistencia a
-        JOIN hijos h ON a.hijo_id = h.id
-        JOIN padres p ON a.padre_id = p.id
-        WHERE a.fecha_hora::date >= $1 
-          AND a.fecha_hora::date <= $2 
-          AND a.guarderia_id = $3
-        ORDER BY a.fecha_hora DESC`
+			SELECT 
+				a.fecha_hora, 
+				h.nombre_niño, 
+				p.nombre as tutor_nombre, 
+				a.tipo_movimiento, 
+				a.aseado, 
+				a.reporte_golpe, 
+				COALESCE(a.observaciones, '')
+			FROM asistencia a
+			JOIN hijos h ON a.hijo_id = h.id
+			JOIN padres p ON a.padre_id = p.id
+			WHERE a.fecha_hora::date >= $1 
+			AND a.fecha_hora::date <= $2 
+			AND a.guarderia_id = $3
+			ORDER BY a.fecha_hora DESC`
 
 		rows, err := db.Query(query, inicio, fin, gID)
 		if err != nil {
