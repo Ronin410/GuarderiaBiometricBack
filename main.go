@@ -282,6 +282,7 @@ func main() {
 
 	r.POST("/identificar", AuthMiddleware(), func(c *gin.Context) {
 		gID, _ := c.Get("guarderia_id")
+
 		colID := getCollectionID(gID) // <-- Buscamos SOLO en su colección
 
 		var input struct {
@@ -305,28 +306,59 @@ func main() {
 		faceID := *result.FaceMatches[0].Face.FaceId
 		confianza := float64(*result.FaceMatches[0].Similarity)
 
-		// Consulta SQL (segmentada por gID por seguridad extra)
-		query := `
-			SELECT p.id, p.nombre, n.id, n.nombre_niño,
-			COALESCE((SELECT tipo_movimiento FROM asistencia WHERE hijo_id = n.id ORDER BY fecha_hora DESC LIMIT 1), 'FUERA')
-			FROM padres p
-			LEFT JOIN tutor_hijos tn ON p.id = tn.padre_id
-			LEFT JOIN hijos n ON tn.hijo_id = n.id
-			WHERE p.face_id = $1 AND p.guarderia_id = $2`
+		// faceID y confianza quemados para tu prueba (o recuperados de Rekognition)
+		//faceID := "9862103f-1b40-4c90-8dff-bb6e25b0700e"
+		//confianza := 99.5
 
-		rows, _ := db.Query(query, faceID, gID)
+		// CONSULTA CORREGIDA: Filtramos la subconsulta por la fecha actual
+		query := `
+        SELECT 
+            p.id, 
+            p.nombre, 
+            n.id, 
+            n.nombre_niño,
+            COALESCE((
+                SELECT tipo_movimiento 
+                FROM asistencia 
+                WHERE hijo_id = n.id 
+                  AND guarderia_id = $2 
+                  AND fecha_hora::date = CURRENT_DATE 
+                ORDER BY fecha_hora DESC 
+                LIMIT 1
+            ), 'AUSENTE') -- Si no hay registros HOY, el niño está AUSENTE
+        FROM padres p
+        LEFT JOIN tutor_hijos tn ON p.id = tn.padre_id
+        LEFT JOIN hijos n ON tn.hijo_id = n.id
+        WHERE p.face_id = $1 AND p.guarderia_id = $2`
+
+		rows, err := db.Query(query, faceID, gID)
+		if err != nil {
+			c.JSON(500, gin.H{"error": "Error en consulta de base de datos"})
+			return
+		}
 		defer rows.Close()
 
 		var padreID int
 		var nombrePadre string
 		var hijos []Hijo
+
+		// Mapa para evitar duplicados si un niño tiene varios tutores (opcional)
 		for rows.Next() {
 			var hID sql.NullInt64
 			var hNom sql.NullString
 			var hEst sql.NullString
-			rows.Scan(&padreID, &nombrePadre, &hID, &hNom, &hEst)
+
+			err := rows.Scan(&padreID, &nombrePadre, &hID, &hNom, &hEst)
+			if err != nil {
+				continue
+			}
+
 			if hID.Valid {
-				hijos = append(hijos, Hijo{ID: int(hID.Int64), Nombre: hNom.String, UltimoEstado: hEst.String})
+				hijos = append(hijos, Hijo{
+					ID:           int(hID.Int64),
+					Nombre:       hNom.String,
+					UltimoEstado: hEst.String, // Aquí llegará 'AUSENTE', 'ENTRADA' o 'SALIDA' pero SOLO de hoy
+				})
 			}
 		}
 
@@ -413,7 +445,6 @@ func main() {
 	})
 
 	r.POST("/confirmar-asistencia", AuthMiddleware(), func(c *gin.Context) {
-		// 1. Obtener la guardería del token
 		gID, _ := c.Get("guarderia_id")
 
 		var req RegistroAsistencia
@@ -422,23 +453,34 @@ func main() {
 			return
 		}
 
-		// 2. Buscamos el último registro de hoy para este niño
-		// IMPORTANTE: También filtramos por guarderia_id para mayor integridad
+		// Buscamos el último registro de HOY
 		var ultimoTipo string
 		err := db.QueryRow(`
         SELECT tipo_movimiento 
         FROM asistencia 
-        WHERE hijo_id = $1 AND guarderia_id = $2 AND fecha_hora::date = CURRENT_DATE 
-        ORDER BY fecha_hora DESC LIMIT 1`, req.HijoID, gID).Scan(&ultimoTipo)
+        WHERE hijo_id = $1 
+          AND guarderia_id = $2 
+          AND fecha_hora::date = CURRENT_DATE 
+        ORDER BY fecha_hora DESC 
+        LIMIT 1`, req.HijoID, gID).Scan(&ultimoTipo)
 
-		// 3. Lógica de cambio de estado (Entrada -> Salida)
+		// Lógica de decisión:
+		// 1. Si no hay registro hoy (err != nil) -> Es una ENTRADA.
+		// 2. Si el último fue ENTRADA -> Es una SALIDA.
+		// 3. Si el último fue SALIDA -> Podrías bloquearlo o permitir re-entrada (aquí lo seteamos como ENTRADA de nuevo).
+
 		tipoFinal := "ENTRADA"
-		if err == nil && ultimoTipo == "ENTRADA" {
-			tipoFinal = "SALIDA"
+		if err == nil {
+			if ultimoTipo == "ENTRADA" {
+				tipoFinal = "SALIDA"
+			} else if ultimoTipo == "SALIDA" {
+				// Opcional: Bloquear si ya salió
+				// c.JSON(400, gin.H{"error": "El niño ya marcó salida hoy"})
+				// return
+				tipoFinal = "ENTRADA" // Re-entrada
+			}
 		}
 
-		// 4. Inserción incluyendo el guarderia_id
-		// Asegúrate de haber ejecutado: ALTER TABLE asistencia ADD COLUMN guarderia_id INTEGER;
 		query := `
         INSERT INTO asistencia (padre_id, hijo_id, aseado, reporte_golpe, observaciones, tipo_movimiento, guarderia_id) 
         VALUES ($1, $2, $3, $4, $5, $6, $7)`
@@ -446,12 +488,10 @@ func main() {
 		_, err = db.Exec(query, req.PadreID, req.HijoID, req.Aseado, req.ReporteGolpe, req.Observaciones, tipoFinal, gID)
 
 		if err != nil {
-			log.Printf("Error insertando asistencia: %v", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "No se pudo guardar el registro"})
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "No se pudo guardar"})
 			return
 		}
 
-		// 5. Respuesta enriquecida
 		c.JSON(http.StatusOK, gin.H{
 			"status":  "Registro guardado",
 			"tipo":    tipoFinal,
