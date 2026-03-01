@@ -19,6 +19,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 	_ "github.com/lib/pq"
+	"golang.org/x/crypto/bcrypt"
 )
 
 var db *sql.DB
@@ -163,6 +164,52 @@ func main() {
 		MaxAge:           12 * time.Hour,
 	}))
 
+	r.POST("/usuarios/registro", func(c *gin.Context) {
+		// 1. Estructura para recibir los datos (ajustada a tu tabla)
+		var nuevoUsuario struct {
+			Username    string `json:"username"`
+			Password    string `json:"password"`
+			GuarderiaID int    `json:"guarderia_id"`
+			Rol         string `json:"rol"`
+			PinAdmin    string `json:"pin_admin"`
+		}
+
+		// Validar JSON
+		if err := c.ShouldBindJSON(&nuevoUsuario); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Datos inválidos"})
+			return
+		}
+
+		// 2. ENCRIPTACIÓN: Generar el Hash de la contraseña
+		// El costo 10 es el estándar recomendado para el plan Professional que manejas
+		hashedPassword, err := bcrypt.GenerateFromPassword([]byte(nuevoUsuario.Password), 10)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Error al procesar seguridad"})
+			return
+		}
+
+		// 3. Inserción en la Base de Datos
+		query := `
+        INSERT INTO usuarios (username, password_hash, guarderia_id, rol, pin_admin)
+        VALUES ($1, $2, $3, $4, $5)`
+
+		_, err = dbAuth.Exec(query,
+			nuevoUsuario.Username,
+			string(hashedPassword), // Guardamos el hash, NO la contraseña plana
+			nuevoUsuario.GuarderiaID,
+			nuevoUsuario.Rol,
+			nuevoUsuario.PinAdmin,
+		)
+
+		if err != nil {
+			fmt.Printf("Error al insertar usuario: %v\n", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "No se pudo crear el usuario"})
+			return
+		}
+
+		c.JSON(http.StatusCreated, gin.H{"message": "Usuario creado exitosamente con hash de seguridad"})
+	})
+
 	r.POST("/login", func(c *gin.Context) {
 		// 1. Estructura para recibir datos de Postman
 		var creds struct {
@@ -199,10 +246,10 @@ func main() {
 			return
 		}
 
-		// 3. COMPARACIÓN EN TEXTO PLANO (MODIFICADO)
-		// Usamos strings.TrimSpace para evitar errores por espacios invisibles en la DB
-		if strings.TrimSpace(passHash) != strings.TrimSpace(creds.Password) {
-			fmt.Printf("FALLO: La clave en DB [%s] no coincide con [%s]\n", passHash, creds.Password)
+		err = bcrypt.CompareHashAndPassword([]byte(passHash), []byte(creds.Password))
+		if err != nil {
+			// Si el error no es nulo, la contraseña no coincide
+			fmt.Printf("FALLO: Intento de login inválido para usuario %s\n", creds.Username)
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "Contraseña incorrecta"})
 			return
 		}
