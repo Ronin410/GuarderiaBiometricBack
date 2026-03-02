@@ -787,108 +787,108 @@ func main() {
 	})
 
 	r.GET("/bitacora", AuthMiddleware(), func(c *gin.Context) {
-		// 1. Obtener el ID de la guardería desde el token
 		gID, _ := c.Get("guarderia_id")
-
 		fechaQuery := c.Query("fecha")
+
 		if fechaQuery == "" {
-			fechaQuery = time.Now().Format("2006-01-02")
+			loc, _ := time.LoadLocation("America/Mazatlan")
+			fechaQuery = time.Now().In(loc).Format("2006-01-02")
 		}
 
-		// 2. Consulta SQL: Seleccionamos TODOS los niños (hijos)
-		// y buscamos su ÚLTIMO movimiento de asistencia en la fecha elegida
-		query := `
-		SELECT 
-			h.id, 
-			h.nombre_niño,
-			COALESCE(ult_mov.tipo_movimiento, 'AUSENTE') as estatus,
-			COALESCE(ult_mov.fecha_hora::text, '') as fecha_hora,
-			COALESCE(ult_mov.aseado, true) as aseado,
-			COALESCE(ult_mov.reporte_golpe, false) as reporte_golpe,
-			COALESCE(ult_mov.observaciones, '') as observaciones
-		FROM hijos h
-		LEFT JOIN LATERAL (
-			/* Esta subconsulta busca el registro más reciente del niño para ese día */
-			SELECT tipo_movimiento, fecha_hora, aseado, reporte_golpe, observaciones
-			FROM asistencia
-			WHERE hijo_id = h.id 
-			AND guarderia_id = $1 
-			AND fecha_hora::date = $2::date
-			ORDER BY fecha_hora DESC
-			LIMIT 1
-		) ult_mov ON true
-		WHERE h.guarderia_id = $1 AND h.activo = true
-		ORDER BY h.nombre_niño ASC`
+		// Definimos el rango del día en formato ISO para Postgres
+		// Esto cubrirá todo el día sin importar el desfase de horas UTC
+		inicioDia := fechaQuery + " 00:00:00-07" // -07 es el offset de Mazatlán
+		finDia := fechaQuery + " 23:59:59-07"
 
-		rows, err := db.Query(query, gID, fechaQuery)
+		query := `
+    SELECT 
+        h.id, 
+        h.nombre_niño,
+        COALESCE(ult_mov.tipo_movimiento, 'AUSENTE') as estatus,
+        COALESCE(TO_CHAR(ult_mov.fecha_hora AT TIME ZONE 'America/Mazatlan', 'HH12:MI AM'), '--:--') as hora_formateada,
+        COALESCE(ult_mov.aseado, true) as aseado,
+        COALESCE(ult_mov.reporte_golpe, false) as reporte_golpe,
+        COALESCE(ult_mov.observaciones, '') as observaciones
+    FROM hijos h
+    LEFT JOIN LATERAL (
+        SELECT tipo_movimiento, fecha_hora, aseado, reporte_golpe, observaciones
+        FROM asistencia
+        WHERE hijo_id = h.id 
+          AND (fecha_hora >= $2::timestamptz AND fecha_hora <= $3::timestamptz)
+        ORDER BY fecha_hora DESC
+        LIMIT 1
+    ) ult_mov ON true
+    WHERE h.guarderia_id = $1 AND h.activo = true
+    ORDER BY h.nombre_niño ASC`
+
+		rows, err := db.Query(query, gID, inicioDia, finDia)
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Error al consultar estatus de alumnos"})
+			log.Printf("Error SQL Bitacora: %v", err)
+			c.JSON(500, gin.H{"error": "Error de base de datos"})
 			return
 		}
 		defer rows.Close()
 
-		registros := []map[string]interface{}{}
-
+		var registros []map[string]interface{}
 		for rows.Next() {
 			var id int
-			var niño, estatus, fecha, obs string
+			var niño, estatus, hora, obs string
 			var aseado, golpe bool
-
-			err := rows.Scan(&id, &niño, &estatus, &fecha, &aseado, &golpe, &obs)
-			if err != nil {
+			if err := rows.Scan(&id, &niño, &estatus, &hora, &aseado, &golpe, &obs); err != nil {
 				continue
 			}
-
 			registros = append(registros, map[string]interface{}{
-				"id":            id,
-				"hijo":          niño,
-				"estatus":       estatus, // ENTRADA, SALIDA o AUSENTE
-				"fecha":         fecha,
-				"aseado":        aseado,
-				"golpe":         golpe,
-				"observaciones": obs,
+				"id": id, "hijo": niño, "estatus": estatus, "fecha_hora": hora,
+				"aseado": aseado, "golpe": golpe, "observaciones": obs,
 			})
 		}
 
-		c.JSON(http.StatusOK, registros)
+		if registros == nil {
+			registros = []map[string]interface{}{}
+		}
+		c.JSON(200, registros)
 	})
 
 	// --- ENDPOINT REPORTES PERSONALIZADOS ---
 	r.GET("/reportes-asistencia", AuthMiddleware(), func(c *gin.Context) {
-		// 1. Obtener la guardería desde el token JWT
 		gID, _ := c.Get("guarderia_id")
-
 		inicio := c.Query("inicio")
 		fin := c.Query("fin")
 
-		// Si no se envían fechas, por defecto usamos el día de hoy
 		if inicio == "" || fin == "" {
-			hoy := time.Now().Format("2006-01-02")
+			loc, _ := time.LoadLocation("America/Mazatlan")
+			hoy := time.Now().In(loc).Format("2006-01-02")
 			inicio = hoy
 			fin = hoy
 		}
 
-		// 2. Consulta SQL con triple filtro: Rango de fechas Y Guardería
+		log.Printf("DEBUG: Buscando reportes -> Guarderia: %v, Inicio: %s, Fin: %s", gID, inicio, fin)
+
+		// EXPLICACIÓN DEL CAMBIO:
+		// Convertimos fecha_hora a la zona de Mazatlán ANTES de extraer el ::date
+		// Así, si algo pasó a las 8 PM en Mazatlán, se filtra como el mismo día, no el siguiente.
 		query := `
-			SELECT 
-				a.fecha_hora, 
-				h.nombre_niño, 
-				p.nombre as tutor_nombre, 
-				a.tipo_movimiento, 
-				a.aseado, 
-				a.reporte_golpe, 
-				COALESCE(a.observaciones, '')
-			FROM asistencia a
-			JOIN hijos h ON a.hijo_id = h.id
-			JOIN padres p ON a.padre_id = p.id
-			WHERE a.fecha_hora::date >= $1 
-			AND a.fecha_hora::date <= $2 
-			AND a.guarderia_id = $3
-			ORDER BY a.fecha_hora DESC`
+			SELECT DISTINCT ON (a.id)
+    TO_CHAR(a.fecha_hora AT TIME ZONE 'America/Mazatlan', 'YYYY-MM-DD HH24:MI:SS') as fecha_formateada,
+    h.nombre_niño, 
+    p.nombre as tutor_nombre, 
+    a.tipo_movimiento, 
+    a.aseado, 
+    a.reporte_golpe, 
+    COALESCE(a.observaciones, '')
+FROM asistencia a
+INNER JOIN hijos h ON a.hijo_id = h.id
+INNER JOIN padres p ON a.padre_id = p.id
+WHERE a.guarderia_id = $3
+  -- Solo una conversión a la zona horaria deseada
+  AND (a.fecha_hora AT TIME ZONE 'America/Mazatlan')::date >= $1::date
+  AND (a.fecha_hora AT TIME ZONE 'America/Mazatlan')::date <= $2::date
+ORDER BY a.id, a.fecha_hora DESC`
 
 		rows, err := db.Query(query, inicio, fin, gID)
 		if err != nil {
 			log.Printf("Error en reporte: %v", err)
+			log.Printf("ERROR EN QUERY: %v", err) // MIRA TU CONSOLA DE GO
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Error al consultar reportes"})
 			return
 		}
@@ -897,10 +897,9 @@ func main() {
 		reportes := []ReporteData{}
 		for rows.Next() {
 			var r ReporteData
-			var fechaTime time.Time
-
+			// Ahora escaneamos directamente como String para evitar que Go intente re-formatear
 			err := rows.Scan(
-				&fechaTime,
+				&r.Fecha, // El string "YYYY-MM-DD HH:mm:ss" que viene del TO_CHAR
 				&r.HijoNombre,
 				&r.TutorNombre,
 				&r.Tipo,
@@ -909,15 +908,12 @@ func main() {
 				&r.Observaciones,
 			)
 			if err != nil {
+				log.Printf("Error escaneando fila: %v", err)
 				continue
 			}
-
-			// Formateamos la fecha para el frontend
-			r.Fecha = fechaTime.Format("02/01/2006 15:04")
 			reportes = append(reportes, r)
 		}
 
-		// Enviamos siempre un slice (aunque esté vacío) para evitar 'null' en el JSON
 		c.JSON(http.StatusOK, reportes)
 	})
 
