@@ -19,6 +19,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 	_ "github.com/lib/pq"
+	"github.com/robfig/cron/v3"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -163,6 +164,8 @@ func main() {
 		AllowCredentials: true,
 		MaxAge:           12 * time.Hour,
 	}))
+
+	iniciarTareasProgramadas(db)
 
 	r.POST("/usuarios/registro", func(c *gin.Context) {
 		// 1. Estructura para recibir los datos (ajustada a tu tabla)
@@ -1011,7 +1014,131 @@ func main() {
 		c.JSON(http.StatusOK, gin.H{"mensaje": "Alumno reactivado correctamente"})
 	})
 
+	// Endpoint para que el admin fuerce la entrada o salida
+	r.POST("/admin/forzar-estatus", AuthMiddleware(), func(c *gin.Context) {
+		var req struct {
+			HijoID     int    `json:"hijo_id"`
+			Movimiento string `json:"tipo_movimiento"` // "ENTRADA" o "SALIDA"
+		}
+
+		// 1. Obtener datos del Token y Body
+		// Extraemos guarderia_id y userID del contexto (inyectados por tu Middleware de Auth)
+		gID, _ := c.Get("guarderia_id")
+
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Datos inválidos"})
+			return
+		}
+
+		// 2. Manejo de Zona Horaria (Igual que en tu Cron)
+		location, err := time.LoadLocation("America/Mazatlan")
+		if err != nil {
+			location = time.UTC // Fallback por seguridad
+		}
+		ahora := time.Now().In(location)
+
+		// 3. Buscar el padre_id del ÚLTIMO registro de asistencia de ese niño
+		var padreID int
+		err = db.QueryRow(`
+        SELECT padre_id 
+        FROM asistencia 
+        WHERE hijo_id = $1 
+        ORDER BY fecha_hora DESC 
+        LIMIT 1`, req.HijoID).Scan(&padreID)
+
+		if err != nil {
+			if err == sql.ErrNoRows {
+				// FALLBACK: Si no hay historial, buscamos al tutor asignado en tutor_hijos
+				err = db.QueryRow("SELECT padre_id FROM tutor_hijos WHERE hijo_id = $1 LIMIT 1", req.HijoID).Scan(&padreID)
+				if err != nil {
+					c.JSON(http.StatusNotFound, gin.H{"error": "El niño no tiene historial ni tutor asignado"})
+					return
+				}
+			} else {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Error al consultar historial"})
+				return
+			}
+		}
+
+		// 4. Insertar en 'asistencia' usando la hora localizada
+		// Cambiamos CURRENT_TIMESTAMP por $5 para pasarle la variable 'ahora'
+		query := `
+        INSERT INTO asistencia (hijo_id, padre_id, guarderia_id, tipo_movimiento, fecha_hora, observaciones) 
+        VALUES ($1, $2, $3, $4, $5, $6)`
+
+		observacion := fmt.Sprintf("Forzado manualmente por Admin")
+
+		_, err = db.Exec(query, req.HijoID, padreID, gID, req.Movimiento, ahora, observacion)
+		if err != nil {
+			fmt.Println("Error al forzar estatus:", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "No se pudo registrar el movimiento"})
+			return
+		}
+
+		c.JSON(http.StatusOK, gin.H{
+			"message": "Estatus actualizado correctamente",
+			"detalles": gin.H{
+				"movimiento": req.Movimiento,
+				"hora_local": ahora.Format("15:04:05"),
+			},
+		})
+	})
+
 	r.Run(":8099")
+}
+
+func iniciarTareasProgramadas(db *sql.DB) {
+	location, err := time.LoadLocation("America/Mazatlan")
+	if err != nil {
+		log.Printf("Error cargando zona horaria: %v", err)
+		location = time.UTC
+	}
+
+	c := cron.New(cron.WithLocation(location))
+
+	// Prueba ajustando a unos minutos adelante de tu hora actual
+	_, err = c.AddFunc("0 23 * * *", func() {
+		ahora := time.Now().In(location)
+		// Definimos el inicio y fin del día actual para la consulta
+		inicioDia := time.Date(ahora.Year(), ahora.Month(), ahora.Day(), 0, 0, 0, 0, location)
+		finDia := inicioDia.Add(24 * time.Hour)
+
+		log.Printf("Iniciando cierre automático [%s] entre %v y %v",
+			ahora.Format("15:04:05"), inicioDia.Format("2006-01-02"), finDia.Format("2006-01-02"))
+
+		query := `
+            INSERT INTO asistencia (hijo_id, padre_id, guarderia_id, tipo_movimiento, fecha_hora, observaciones)
+            SELECT DISTINCT ON (a1.hijo_id) 
+                a1.hijo_id, 
+                a1.padre_id, 
+                a1.guarderia_id, 
+                'SALIDA', 
+                $1::timestamp with time zone, 
+                'Cierre automático nocturno'
+            FROM asistencia a1
+            WHERE a1.tipo_movimiento = 'ENTRADA'
+            AND a1.fecha_hora >= $2 AND a1.fecha_hora < $3
+            AND NOT EXISTS (
+                SELECT 1 FROM asistencia a2 
+                WHERE a2.hijo_id = a1.hijo_id 
+                AND a2.tipo_movimiento = 'SALIDA' 
+                AND a2.fecha_hora >= $2 AND a2.fecha_hora < $3
+            )
+            ORDER BY a1.hijo_id, a1.fecha_hora DESC`
+
+		// Pasamos: 1. El momento de la salida, 2. Inicio del día, 3. Fin del día
+		result, err := db.Exec(query, ahora, inicioDia, finDia)
+		if err != nil {
+			log.Printf("FALLO en el cierre: %v", err)
+			return
+		}
+
+		filas, _ := result.RowsAffected()
+		log.Printf("Cierre completado. Niños actualizados: %d", filas)
+	})
+
+	c.Start()
+	log.Println("Cron iniciado con rango de fechas seguro")
 }
 
 func RunMigrations() {
