@@ -230,15 +230,17 @@ func main() {
 		fmt.Printf("Intentando login plano: Usuario[%s] Pass[%s]\n", creds.Username, creds.Password)
 
 		var id, gID int
-		var passHash, rol, pin string
-
+		var passHash, rol, pin, gNombre, gSlug string
 		// 2. Consulta a la base de datos
 		query := `
-		SELECT id, guarderia_id, password_hash, rol, pin_admin 
-		FROM usuarios 
-		WHERE username = $1`
+		SELECT 
+            u.id, u.guarderia_id, u.password_hash, u.rol, u.pin_admin,
+            g.nombre, g.slug
+        FROM usuarios u
+        INNER JOIN guarderias g ON u.guarderia_id = g.id
+        WHERE u.username = $1`
 
-		err := dbAuth.QueryRow(query, creds.Username).Scan(&id, &gID, &passHash, &rol, &pin)
+		err := dbAuth.QueryRow(query, creds.Username).Scan(&id, &gID, &passHash, &rol, &pin, &gNombre, &gSlug)
 		if err != nil {
 			if err == sql.ErrNoRows {
 				fmt.Printf("Usuario no encontrado: %s\n", creds.Username)
@@ -278,11 +280,13 @@ func main() {
 		// 5. Respuesta Exitosa
 		fmt.Printf("Login exitoso (Texto Plano): %s\n", creds.Username)
 		c.JSON(http.StatusOK, gin.H{
-			"token":        tokenStr,
-			"guarderia_id": gID,
-			"rol":          rol,
-			"username":     creds.Username,
-			"pin_admin":    pin,
+			"token":            tokenStr,
+			"guarderia_id":     gID,
+			"guarderia_nombre": gNombre, // Nuevo
+			"guarderia_slug":   gSlug,   // Nuevo
+			"rol":              rol,
+			"username":         creds.Username,
+			"pin_admin":        pin,
 		})
 	})
 
