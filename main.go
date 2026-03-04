@@ -337,15 +337,19 @@ func main() {
 
 	r.POST("/identificar", AuthMiddleware(), func(c *gin.Context) {
 		gID, _ := c.Get("guarderia_id")
-
-		colID := getCollectionID(gID) // <-- Buscamos SOLO en su colección
+		colID := getCollectionID(gID)
 
 		var input struct {
 			Imagen string `json:"imagen"`
 		}
-		c.BindJSON(&input)
+		if err := c.BindJSON(&input); err != nil {
+			c.JSON(400, gin.H{"error": "Imagen requerida"})
+			return
+		}
+
 		imgBytes, _ := base64.StdEncoding.DecodeString(input.Imagen)
 
+		// 1. Identificación facial con Rekognition
 		result, err := rekClient.SearchFacesByImage(context.TODO(), &rekognition.SearchFacesByImageInput{
 			CollectionId:       aws.String(colID),
 			FaceMatchThreshold: aws.Float32(90.0),
@@ -361,64 +365,72 @@ func main() {
 		faceID := *result.FaceMatches[0].Face.FaceId
 		confianza := float64(*result.FaceMatches[0].Similarity)
 
-		// faceID y confianza quemados para tu prueba (o recuperados de Rekognition)
-		//faceID := "9862103f-1b40-4c90-8dff-bb6e25b0700e"
-		//confianza := 99.5
-
-		// CONSULTA CORREGIDA: Filtramos la subconsulta por la fecha actual
+		// 2. CONSULTA CON ZONA HORARIA CORRECTA (America/Mazatlan para Culiacán)
+		// Esta query asegura que "hoy" termine a las 12:00 AM de Culiacán, no de Londres.
 		query := `
-        SELECT 
-            p.id, 
-            p.nombre, 
-            n.id, 
-            n.nombre_niño,
-            COALESCE((
-                SELECT tipo_movimiento 
-                FROM asistencia 
-                WHERE hijo_id = n.id 
-                  AND guarderia_id = $2 
-                  AND fecha_hora::date = CURRENT_DATE 
-                ORDER BY fecha_hora DESC 
-                LIMIT 1
-            ), 'AUSENTE') -- Si no hay registros HOY, el niño está AUSENTE
-        FROM padres p
-        LEFT JOIN tutor_hijos tn ON p.id = tn.padre_id
-        LEFT JOIN hijos n ON tn.hijo_id = n.id AND n.activo = true
-        WHERE p.face_id = $1 AND p.guarderia_id = $2`
+    SELECT 
+        p.id AS padre_id, 
+        p.nombre AS padre_nombre, 
+        n.id AS hijo_id, 
+        n.nombre_niño AS hijo_nombre, 
+        COALESCE((
+            SELECT tipo_movimiento 
+            FROM asistencia 
+            WHERE hijo_id = n.id 
+              AND guarderia_id = $2 
+              -- Solo un AT TIME ZONE para convertir de UTC a local correctamente
+              AND (fecha_hora AT TIME ZONE 'America/Mazatlan')::date = 
+                  (CURRENT_TIMESTAMP AT TIME ZONE 'America/Mazatlan')::date
+            ORDER BY fecha_hora DESC 
+            LIMIT 1
+        ), 'AUSENTE') as ultimo_estado
+    FROM padres p
+    INNER JOIN tutor_hijos tn ON p.id = tn.padre_id
+    INNER JOIN hijos n ON tn.hijo_id = n.id
+    WHERE p.face_id = $1 
+      AND p.guarderia_id = $2 
+      AND n.activo = true`
 
 		rows, err := db.Query(query, faceID, gID)
 		if err != nil {
-			c.JSON(500, gin.H{"error": "Error en consulta de base de datos"})
+			c.JSON(500, gin.H{"error": "Error en base de datos: " + err.Error()})
 			return
 		}
 		defer rows.Close()
 
 		var padreID int
 		var nombrePadre string
-		var hijos []Hijo
+		var hijos []Hijo // Asegúrate de tener definido type Hijo struct { ID int; Nombre string; UltimoEstado string }
 
-		// Mapa para evitar duplicados si un niño tiene varios tutores (opcional)
 		for rows.Next() {
-			var hID sql.NullInt64
-			var hNom sql.NullString
-			var hEst sql.NullString
+			var hID int
+			var hNom string
+			var hEst string
 
+			// Escaneamos directamente ya que el INNER JOIN garantiza que existan
 			err := rows.Scan(&padreID, &nombrePadre, &hID, &hNom, &hEst)
 			if err != nil {
 				continue
 			}
 
-			if hID.Valid {
-				hijos = append(hijos, Hijo{
-					ID:           int(hID.Int64),
-					Nombre:       hNom.String,
-					UltimoEstado: hEst.String, // Aquí llegará 'AUSENTE', 'ENTRADA' o 'SALIDA' pero SOLO de hoy
-				})
-			}
+			hijos = append(hijos, Hijo{
+				ID:           hID,
+				Nombre:       hNom,
+				UltimoEstado: hEst,
+			})
+		}
+
+		// 3. Respuesta al Frontend
+		if len(hijos) == 0 {
+			c.JSON(404, gin.H{"mensaje": "Padre identificado pero no tiene hijos activos asignados"})
+			return
 		}
 
 		c.JSON(200, RespuestaIdentificacion{
-			PadreID: padreID, Padre: nombrePadre, Confianza: confianza, Hijos: hijos,
+			PadreID:   padreID,
+			Padre:     nombrePadre,
+			Confianza: confianza,
+			Hijos:     hijos,
 		})
 	})
 
@@ -1066,7 +1078,7 @@ ORDER BY a.id, a.fecha_hora DESC`
         INSERT INTO asistencia (hijo_id, padre_id, guarderia_id, tipo_movimiento, fecha_hora, observaciones) 
         VALUES ($1, $2, $3, $4, $5, $6)`
 
-		observacion := fmt.Sprintf("Forzado manualmente por Admin")
+		observacion := fmt.Sprintf("Actualizado por Admin")
 
 		_, err = db.Exec(query, req.HijoID, padreID, gID, req.Movimiento, ahora, observacion)
 		if err != nil {
