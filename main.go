@@ -1,11 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/base64"
 	"fmt"
+	"io"
 	"log"
+	"mime/multipart"
 	"net/http"
 	"os"
 	"strings"
@@ -15,6 +18,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/rekognition"
 	"github.com/aws/aws-sdk-go-v2/service/rekognition/types"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types" // <--- AGREGA ESTO CON ESTE ALIAS
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
@@ -72,6 +77,18 @@ type RegistroAsistencia struct {
 type VinculacionRequest struct {
 	PadreID int `json:"padre_id"`
 	HijoID  int `json:"hijo_id"`
+}
+
+type SeguimientoDiario struct {
+	HijoID        int    `json:"hijo_id"`
+	GuarderiaID   int    `json:"guarderia_id"`
+	Fecha         string `json:"fecha"` // YYYY-MM-DD
+	Desayuno      string `json:"desayuno"`
+	Comida        string `json:"comida"`
+	Merienda      string `json:"merienda"`
+	Esfinter      string `json:"esfinter"`
+	Observaciones string `json:"observaciones"`
+	FotoURL       string `json:"foto_url"`
 }
 
 type ReporteData struct {
@@ -368,28 +385,28 @@ func main() {
 		// 2. CONSULTA CON ZONA HORARIA CORRECTA (America/Mazatlan para Culiacán)
 		// Esta query asegura que "hoy" termine a las 12:00 AM de Culiacán, no de Londres.
 		query := `
-    SELECT 
-        p.id AS padre_id, 
-        p.nombre AS padre_nombre, 
-        n.id AS hijo_id, 
-        n.nombre_niño AS hijo_nombre, 
-        COALESCE((
-            SELECT tipo_movimiento 
-            FROM asistencia 
-            WHERE hijo_id = n.id 
-              AND guarderia_id = $2 
-              -- Solo un AT TIME ZONE para convertir de UTC a local correctamente
-              AND (fecha_hora AT TIME ZONE 'America/Mazatlan')::date = 
-                  (CURRENT_TIMESTAMP AT TIME ZONE 'America/Mazatlan')::date
-            ORDER BY fecha_hora DESC 
-            LIMIT 1
-        ), 'AUSENTE') as ultimo_estado
-    FROM padres p
-    INNER JOIN tutor_hijos tn ON p.id = tn.padre_id
-    INNER JOIN hijos n ON tn.hijo_id = n.id
-    WHERE p.face_id = $1 
-      AND p.guarderia_id = $2 
-      AND n.activo = true`
+		SELECT 
+	        p.id AS padre_id, 
+			p.nombre AS padre_nombre, 
+			n.id AS hijo_id, 
+			n.nombre_niño AS hijo_nombre, 
+			COALESCE((
+				SELECT tipo_movimiento 
+				FROM asistencia 
+				WHERE hijo_id = n.id 
+				AND guarderia_id = $2 
+				-- Solo un AT TIME ZONE para convertir de UTC a local correctamente
+				AND (fecha_hora AT TIME ZONE 'America/Mazatlan')::date = 
+					(CURRENT_TIMESTAMP AT TIME ZONE 'America/Mazatlan')::date
+				ORDER BY fecha_hora DESC 
+				LIMIT 1
+			), 'AUSENTE') as ultimo_estado
+		FROM padres p
+		INNER JOIN tutor_hijos tn ON p.id = tn.padre_id
+		INNER JOIN hijos n ON tn.hijo_id = n.id
+		WHERE p.face_id = $1 
+		AND p.guarderia_id = $2 
+		AND n.activo = true`
 
 		rows, err := db.Query(query, faceID, gID)
 		if err != nil {
@@ -474,10 +491,25 @@ func main() {
 	r.GET("/padre/:id/hijos", AuthMiddleware(), func(c *gin.Context) {
 		// 1. Extraemos el guarderia_id del token
 		gID, _ := c.Get("guarderia_id")
+		tokenUsuarioID, _ := c.Get("user_id") // ID del usuario logueado
+		rol, _ := c.Get("rol")                // Rol del usuario
 
 		// 2. Obtenemos el ID del padre de la URL
 		padreID := c.Param("id")
 
+		// --- LÓGICA DE COMODÍN PARA EL PAPÁ ---
+		// Si el ID es "0", usamos el ID que viene dentro del Token
+		if padreID == "0" {
+			// Convertimos el ID del token a string para la consulta si es necesario
+			padreID = fmt.Sprintf("%v", tokenUsuarioID)
+		} else {
+			// SEGURIDAD: Si no es "0", verificamos que quien consulta sea ADMIN o STAFF
+			// Esto evita que un papá cambie el "0" por el ID de otro papá en la URL
+			if rol != "admin" && rol != "staff" {
+				c.JSON(http.StatusForbidden, gin.H{"error": "No tienes permiso para consultar otros IDs"})
+				return
+			}
+		}
 		// 3. Consulta con DOBLE FILTRO:
 		// Filtramos por padre_id Y por guarderia_id para asegurar que pertenezcan a la misma sede
 		query := `
@@ -817,25 +849,25 @@ func main() {
 		finDia := fechaQuery + " 23:59:59-07"
 
 		query := `
-    SELECT 
-        h.id, 
-        h.nombre_niño,
-        COALESCE(ult_mov.tipo_movimiento, 'AUSENTE') as estatus,
-        COALESCE(TO_CHAR(ult_mov.fecha_hora AT TIME ZONE 'America/Mazatlan', 'HH12:MI AM'), '--:--') as hora_formateada,
-        COALESCE(ult_mov.aseado, true) as aseado,
-        COALESCE(ult_mov.reporte_golpe, false) as reporte_golpe,
-        COALESCE(ult_mov.observaciones, '') as observaciones
-    FROM hijos h
-    LEFT JOIN LATERAL (
-        SELECT tipo_movimiento, fecha_hora, aseado, reporte_golpe, observaciones
-        FROM asistencia
-        WHERE hijo_id = h.id 
-          AND (fecha_hora >= $2::timestamptz AND fecha_hora <= $3::timestamptz)
-        ORDER BY fecha_hora DESC
-        LIMIT 1
-    ) ult_mov ON true
-    WHERE h.guarderia_id = $1 AND h.activo = true
-    ORDER BY h.nombre_niño ASC`
+			SELECT 
+				h.id, 
+				h.nombre_niño,
+				COALESCE(ult_mov.tipo_movimiento, 'AUSENTE') as estatus,
+				COALESCE(TO_CHAR(ult_mov.fecha_hora AT TIME ZONE 'America/Mazatlan', 'HH12:MI AM'), '--:--') as hora_formateada,
+				COALESCE(ult_mov.aseado, true) as aseado,
+				COALESCE(ult_mov.reporte_golpe, false) as reporte_golpe,
+				COALESCE(ult_mov.observaciones, '') as observaciones
+			FROM hijos h
+			LEFT JOIN LATERAL (
+				SELECT tipo_movimiento, fecha_hora, aseado, reporte_golpe, observaciones
+				FROM asistencia
+				WHERE hijo_id = h.id 
+				AND (fecha_hora >= $2::timestamptz AND fecha_hora <= $3::timestamptz)
+				ORDER BY fecha_hora DESC
+				LIMIT 1
+			) ult_mov ON true
+			WHERE h.guarderia_id = $1 AND h.activo = true
+			ORDER BY h.nombre_niño ASC`
 
 		rows, err := db.Query(query, gID, inicioDia, finDia)
 		if err != nil {
@@ -878,56 +910,74 @@ func main() {
 			fin = hoy
 		}
 
-		log.Printf("DEBUG: Buscando reportes -> Guarderia: %v, Inicio: %s, Fin: %s", gID, inicio, fin)
-
-		// EXPLICACIÓN DEL CAMBIO:
-		// Convertimos fecha_hora a la zona de Mazatlán ANTES de extraer el ::date
-		// Así, si algo pasó a las 8 PM en Mazatlán, se filtra como el mismo día, no el siguiente.
+		// El cambio principal es el LEFT JOIN con seguimiento basado en la fecha del registro
 		query := `
-			SELECT DISTINCT ON (a.id)
-    TO_CHAR(a.fecha_hora AT TIME ZONE 'America/Mazatlan', 'YYYY-MM-DD HH24:MI:SS') as fecha_formateada,
-    h.nombre_niño, 
-    p.nombre as tutor_nombre, 
-    a.tipo_movimiento, 
-    a.aseado, 
-    a.reporte_golpe, 
-    COALESCE(a.observaciones, '')
-FROM asistencia a
-INNER JOIN hijos h ON a.hijo_id = h.id
-INNER JOIN padres p ON a.padre_id = p.id
-WHERE a.guarderia_id = $3
-  -- Solo una conversión a la zona horaria deseada
-  AND (a.fecha_hora AT TIME ZONE 'America/Mazatlan')::date >= $1::date
-  AND (a.fecha_hora AT TIME ZONE 'America/Mazatlan')::date <= $2::date
-ORDER BY a.id, a.fecha_hora DESC`
+        SELECT 
+            TO_CHAR(a.fecha_hora AT TIME ZONE 'America/Mazatlan', 'YYYY-MM-DD HH24:MI:SS') as fecha_formateada,
+            h.nombre_niño, 
+            p.nombre as tutor_nombre, 
+            a.tipo_movimiento, 
+            a.aseado, 
+            a.reporte_golpe, 
+            COALESCE(a.observaciones, '') as obs_asistencia,
+            -- Nuevos campos pedagógicos de la bitácora
+            COALESCE(s.desayuno, '') as desayuno,
+            COALESCE(s.comida, '') as comida,
+            COALESCE(s.merienda, '') as merienda,
+            COALESCE(s.esfinter, '') as esfinter,
+            COALESCE(s.durmio, false) as durmio,
+            COALESCE(s.observaciones, '') as obs_pedagogicas
+        FROM asistencia a
+        INNER JOIN hijos h ON a.hijo_id = h.id
+        INNER JOIN padres p ON a.padre_id = p.id
+        -- Unimos con seguimiento usando el ID del hijo y la FECHA (sin hora) del movimiento
+        LEFT JOIN seguimiento_diario s ON s.hijo_id = a.hijo_id 
+            AND s.fecha = (a.fecha_hora AT TIME ZONE 'America/Mazatlan')::date
+        WHERE a.guarderia_id = $3
+          AND (a.fecha_hora AT TIME ZONE 'America/Mazatlan')::date >= $1::date
+          AND (a.fecha_hora AT TIME ZONE 'America/Mazatlan')::date <= $2::date
+        ORDER BY a.fecha_hora DESC`
 
 		rows, err := db.Query(query, inicio, fin, gID)
 		if err != nil {
-			log.Printf("Error en reporte: %v", err)
-			log.Printf("ERROR EN QUERY: %v", err) // MIRA TU CONSOLA DE GO
+			log.Printf("Error en reporte detallado: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Error al consultar reportes"})
 			return
 		}
 		defer rows.Close()
 
-		reportes := []ReporteData{}
+		var reportes []map[string]interface{}
 		for rows.Next() {
-			var r ReporteData
-			// Ahora escaneamos directamente como String para evitar que Go intente re-formatear
+			var fecha, niño, tutor, tipo, obsAsis, desayuno, comida, merienda, esfinter, obsPed string
+			var aseado, golpe, durmio bool
+
 			err := rows.Scan(
-				&r.Fecha, // El string "YYYY-MM-DD HH:mm:ss" que viene del TO_CHAR
-				&r.HijoNombre,
-				&r.TutorNombre,
-				&r.Tipo,
-				&r.Aseado,
-				&r.ReporteGolpe,
-				&r.Observaciones,
+				&fecha, &niño, &tutor, &tipo, &aseado, &golpe, &obsAsis,
+				&desayuno, &comida, &merienda, &esfinter, &durmio, &obsPed,
 			)
 			if err != nil {
 				log.Printf("Error escaneando fila: %v", err)
 				continue
 			}
-			reportes = append(reportes, r)
+
+			// Estructuramos la respuesta para que el Frontend la maneje fácilmente
+			reportes = append(reportes, map[string]interface{}{
+				"fecha":          fecha, //
+				"hijo_nombre":    niño,  //
+				"tutor_nombre":   tutor, //
+				"tipo":           tipo,  //
+				"aseado":         aseado,
+				"golpe":          golpe,
+				"obs_asistencia": obsAsis,
+				"bitacora": map[string]interface{}{
+					"desayuno":      desayuno, //
+					"comida":        comida,   //
+					"merienda":      merienda, //
+					"esfinter":      esfinter, //
+					"durmio":        durmio,   //
+					"observaciones": obsPed,   //
+				},
+			})
 		}
 
 		c.JSON(http.StatusOK, reportes)
@@ -1096,7 +1146,199 @@ ORDER BY a.id, a.fecha_hora DESC`
 		})
 	})
 
+	// --- ACTUALIZAR O CREAR BITÁCORA DIARIA (Punto 1) ---
+	r.POST("/seguimiento", AuthMiddleware(), func(c *gin.Context) {
+		gID, _ := c.Get("guarderia_id")
+
+		// 1. Obtener datos de texto del Formulario
+		hijoID := c.PostForm("hijo_id")
+		desayuno := c.PostForm("desayuno")
+		comida := c.PostForm("comida")
+		merienda := c.PostForm("merienda")
+		esfinter := c.PostForm("esfinter")
+		observaciones := c.PostForm("observaciones")
+
+		durmio := c.PostForm("durmio") == "true"
+
+		// 2. Manejo de Fecha Local
+		location, err := time.LoadLocation("America/Mazatlan")
+		if err != nil {
+			location = time.UTC
+		}
+		ahora := time.Now().In(location)
+		fechaHoy := ahora.Format("2006-01-02")
+
+		// 3. Query UPSERT: Insertamos o actualizamos y RETORNAMOS el ID del registro
+		// Nota: Eliminamos foto_url de aquí porque ahora van a otra tabla
+		var seguimientoID int
+		query := `
+        INSERT INTO seguimiento_diario 
+        (hijo_id, guarderia_id, fecha, desayuno, comida, merienda, esfinter, observaciones, durmio)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        ON CONFLICT (hijo_id, fecha) 
+        DO UPDATE SET 
+            desayuno = EXCLUDED.desayuno,
+            comida = EXCLUDED.comida,
+            merienda = EXCLUDED.merienda,
+            esfinter = EXCLUDED.esfinter,
+            observaciones = EXCLUDED.observaciones,
+            durmio = EXCLUDED.durmio	
+        RETURNING id;`
+
+		err = db.QueryRow(query, hijoID, gID, fechaHoy, desayuno, comida, merienda, esfinter, observaciones, durmio).Scan(&seguimientoID)
+		if err != nil {
+			fmt.Println("Error al guardar bitácora:", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "No se pudo actualizar la bitácora"})
+			return
+		}
+
+		// 4. Manejo de MÚLTIPLES FOTOS
+		// Recogemos todos los archivos que vengan bajo la llave "fotos"
+		form, _ := c.MultipartForm()
+		files := form.File["fotos"]
+
+		var urlsSubidas []string
+
+		for _, file := range files {
+			// Generamos un nombre único para cada foto dentro de su carpeta
+			nombreArchivo := fmt.Sprintf("guarderia_%v/hijo_%s/%s_%s_%s",
+				gID, hijoID, fechaHoy, ahora.Format("150405"), file.Filename)
+
+			// Subimos a S3 usando tu función existente
+			url, errS3 := uploadToS3(file, nombreArchivo)
+			if errS3 != nil {
+				fmt.Printf("Error subiendo archivo %s a S3: %v\n", file.Filename, errS3)
+				continue // Si falla una foto, intentamos con la siguiente
+			}
+
+			// 5. Insertamos la URL en la tabla de fotos vinculada al seguimientoID
+			_, errDBFoto := db.Exec("INSERT INTO fotos_seguimiento (seguimiento_id, url) VALUES ($1, $2)", seguimientoID, url)
+			if errDBFoto != nil {
+				fmt.Println("Error guardando URL en DB:", errDBFoto)
+			} else {
+				urlsSubidas = append(urlsSubidas, url)
+			}
+		}
+
+		c.JSON(http.StatusOK, gin.H{
+			"mensaje":        "Información de bitácora y fotos guardadas correctamente",
+			"seguimiento_id": seguimientoID,
+			"fotos_subidas":  len(urlsSubidas),
+			"urls":           urlsSubidas,
+		})
+	})
+
+	r.GET("/seguimiento/:hijo_id", AuthMiddleware(), func(c *gin.Context) {
+		hijoID := c.Param("hijo_id")
+
+		// 1. Obtener la fecha de la URL (ej: ?fecha=2024-03-05)
+		// Si no viene en la URL, usamos la fecha de hoy
+		fechaConsulta := c.Query("fecha")
+
+		location, _ := time.LoadLocation("America/Mazatlan")
+		if fechaConsulta == "" {
+			fechaConsulta = time.Now().In(location).Format("2006-01-02")
+		}
+
+		// Estructura para la respuesta
+		type SeguimientoCompleto struct {
+			ID            int      `json:"id"`
+			HijoID        int      `json:"hijo_id"`
+			Fecha         string   `json:"fecha"`
+			Desayuno      string   `json:"desayuno"`
+			Comida        string   `json:"comida"`
+			Merienda      string   `json:"merienda"`
+			Esfinter      string   `json:"esfinter"`
+			Observaciones string   `json:"observaciones"`
+			Durmio        bool     `json:"durmio"`
+			Fotos         []string `json:"fotos"`
+		}
+
+		var s SeguimientoCompleto
+
+		// 2. Consulta principal (Datos de la bitácora)
+		querySeguimiento := `
+        SELECT id, hijo_id, fecha, desayuno, comida, merienda, esfinter, observaciones, durmio 
+        FROM seguimiento_diario 
+        WHERE hijo_id = $1 AND fecha = $2`
+
+		err := db.QueryRow(querySeguimiento, hijoID, fechaConsulta).Scan(
+			&s.ID, &s.HijoID, &s.Fecha, &s.Desayuno, &s.Comida,
+			&s.Merienda, &s.Esfinter, &s.Observaciones, &s.Durmio,
+		)
+
+		if err != nil {
+			// Si no hay datos, enviamos un 404 con un mensaje amigable
+			c.JSON(http.StatusNotFound, gin.H{
+				"error": "No hay reporte disponible para la fecha: " + fechaConsulta,
+			})
+			return
+		}
+
+		// 3. Consulta de fotos (Todas las que pertenezcan a ese ID de seguimiento)
+		rows, err := db.Query("SELECT url FROM fotos_seguimiento WHERE seguimiento_id = $1", s.ID)
+		if err == nil {
+			defer rows.Close()
+			s.Fotos = []string{} // Inicializamos como array vacío para que no sea 'null' en JSON
+			for rows.Next() {
+				var url string
+				if err := rows.Scan(&url); err == nil {
+					s.Fotos = append(s.Fotos, url)
+				}
+			}
+		}
+
+		c.JSON(http.StatusOK, s)
+	})
+
 	r.Run(":8099")
+}
+
+func uploadToS3(fileHeader *multipart.FileHeader, fileName string) (string, error) {
+	// Abrir el archivo que viene del formulario
+	file, err := fileHeader.Open()
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+
+	// Leer el contenido a un buffer de bytes
+	buffer, err := io.ReadAll(file)
+	if err != nil {
+		return "", err
+	}
+
+	// Cargar configuración de AWS (tomará las variables de entorno de Render/Sistema)
+	cfg, err := config.LoadDefaultConfig(context.TODO())
+	if err != nil {
+		return "", err
+	}
+
+	client := s3.NewFromConfig(cfg)
+	bucketName := "biosafe-storage-fotos" // Tu bucket recién creado
+
+	// Subir el objeto a S3
+	_, err = client.PutObject(context.TODO(), &s3.PutObjectInput{
+		Bucket:      aws.String(bucketName),
+		Key:         aws.String(fileName),
+		Body:        bytes.NewReader(buffer),
+		ContentType: aws.String("image/jpeg"),          // Ajusta si permites otros formatos
+		ACL:         s3types.ObjectCannedACLPublicRead, // Esto permite que el papá vea la foto
+	})
+
+	if err != nil {
+		return "", err
+	}
+
+	// Construir la URL pública de la imagen
+	// La URL sigue el patrón: https://bucket.s3.region.amazonaws.com/key
+	region := os.Getenv("AWS_REGION")
+	if region == "" {
+		region = "us-east-1"
+	} // Fallback si no está la variable
+
+	url := fmt.Sprintf("https://%s.s3.%s.amazonaws.com/%s", bucketName, region, fileName)
+	return url, nil
 }
 
 func iniciarTareasProgramadas(db *sql.DB) {
@@ -1214,6 +1456,28 @@ func RunMigrations() {
 			reporte_golpe BOOLEAN DEFAULT false,
 			observaciones TEXT,
 			tipo_movimiento VARCHAR(20) CHECK (tipo_movimiento IN ('ENTRADA', 'SALIDA', 'REGISTRO'))
+		);`,
+
+		// Nueva tabla para el seguimiento diario
+		`CREATE TABLE IF NOT EXISTS seguimiento_diario (
+			id SERIAL PRIMARY KEY,
+			hijo_id INTEGER REFERENCES hijos(id) ON DELETE CASCADE,
+			guarderia_id INTEGER REFERENCES guarderias(id) ON DELETE CASCADE,
+			fecha DATE DEFAULT CURRENT_DATE,
+			desayuno VARCHAR(20) DEFAULT 'pendiente', -- 'no_comio', 'poco', 'todo'
+			comida VARCHAR(20) DEFAULT 'pendiente',
+			merienda VARCHAR(20) DEFAULT 'pendiente',
+			esfinter VARCHAR(50), 
+			foto_url TEXT,
+			observaciones TEXT,
+			UNIQUE(hijo_id, fecha) -- Evita duplicados para el mismo niño el mismo día
+		);`,
+
+		`CREATE TABLE fotos_seguimiento (
+			id SERIAL PRIMARY KEY,
+			seguimiento_id INT REFERENCES seguimiento_diario(id),
+			url TEXT NOT NULL,
+			creado_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 		);`,
 
 		// 7. Índices adicionales
