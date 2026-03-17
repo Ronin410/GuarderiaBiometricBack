@@ -452,7 +452,7 @@ func main() {
 	})
 
 	r.POST("/registrar-hijo", AuthMiddleware(), func(c *gin.Context) {
-		// 1. Extraemos el guarderia_id del token (inyectado por el Middleware)
+		// 1. Extraemos el guarderia_id del token
 		gID, exists := c.Get("guarderia_id")
 		if !exists {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "No se pudo identificar la guardería"})
@@ -469,22 +469,29 @@ func main() {
 		}
 
 		var hijoID int
-		// 2. Modificamos el INSERT para incluir el guarderia_id
-		query := "INSERT INTO hijos (nombre_niño, guarderia_id) VALUES ($1, $2) RETURNING id"
+		var urlToken string // Variable para capturar el token generado
 
-		// 3. Ejecutamos la consulta pasando el nombre y el ID de la guardería
-		err := db.QueryRow(query, input.Nombre, gID).Scan(&hijoID)
+		// 2. Modificamos el INSERT para incluir url_token usando gen_random_uuid()
+		// Agregamos RETURNING id, url_token para devolver el link al frontend de una vez
+		query := `
+        INSERT INTO hijos (nombre_niño, guarderia_id, url_token) 
+        VALUES ($1, $2, gen_random_uuid()) 
+        RETURNING id, url_token`
+
+		// 3. Ejecutamos y escaneamos ambos valores resultantes
+		err := db.QueryRow(query, input.Nombre, gID).Scan(&hijoID, &urlToken)
 		if err != nil {
 			fmt.Printf("Error al insertar hijo: %v\n", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Error al crear niño en la base de datos"})
 			return
 		}
 
-		// 4. Respuesta exitosa
+		// 4. Respuesta exitosa incluyendo el token generado
 		c.JSON(http.StatusOK, gin.H{
 			"id":           hijoID,
 			"nombre":       input.Nombre,
 			"guarderia_id": gID,
+			"url_token":    urlToken, // El frontend ahora tiene el token para el link
 		})
 	})
 
@@ -1157,7 +1164,6 @@ func main() {
 		merienda := c.PostForm("merienda")
 		esfinter := c.PostForm("esfinter")
 		observaciones := c.PostForm("observaciones")
-
 		durmio := c.PostForm("durmio") == "true"
 
 		// 2. Manejo de Fecha Local
@@ -1168,63 +1174,76 @@ func main() {
 		ahora := time.Now().In(location)
 		fechaHoy := ahora.Format("2006-01-02")
 
-		// 3. Query UPSERT: Insertamos o actualizamos y RETORNAMOS el ID del registro
-		// Nota: Eliminamos foto_url de aquí porque ahora van a otra tabla
+		// 3. Query UPSERT
 		var seguimientoID int
 		query := `
-        INSERT INTO seguimiento_diario 
-        (hijo_id, guarderia_id, fecha, desayuno, comida, merienda, esfinter, observaciones, durmio)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-        ON CONFLICT (hijo_id, fecha) 
-        DO UPDATE SET 
-            desayuno = EXCLUDED.desayuno,
-            comida = EXCLUDED.comida,
-            merienda = EXCLUDED.merienda,
-            esfinter = EXCLUDED.esfinter,
-            observaciones = EXCLUDED.observaciones,
-            durmio = EXCLUDED.durmio	
-        RETURNING id;`
+    INSERT INTO seguimiento_diario 
+    (hijo_id, guarderia_id, fecha, desayuno, comida, merienda, esfinter, observaciones, durmio)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+    ON CONFLICT (hijo_id, fecha) 
+    DO UPDATE SET 
+        desayuno = EXCLUDED.desayuno,
+        comida = EXCLUDED.comida,
+        merienda = EXCLUDED.merienda,
+        esfinter = EXCLUDED.esfinter,
+        observaciones = EXCLUDED.observaciones,
+        durmio = EXCLUDED.durmio    
+    RETURNING id;`
 
 		err = db.QueryRow(query, hijoID, gID, fechaHoy, desayuno, comida, merienda, esfinter, observaciones, durmio).Scan(&seguimientoID)
 		if err != nil {
-			fmt.Println("Error al guardar bitácora:", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "No se pudo actualizar la bitácora"})
 			return
 		}
 
+		// --- ACTUALIZADO: OBTENER EL TUTOR CONFIGURADO PARA WHATSAPP ---
+		var padreID int
+		var telefonoPadre string
+
+		// Este query usa la tabla relacional y filtra por el nuevo booleano
+		// Si usas el booleano en la tabla 'padres' sería: p.recibe_whatsapp
+		// Si lo usas en la relacional sería: th.recibe_whatsapp
+		queryPadre := `
+        SELECT p.id, p.celular 
+        FROM padres p
+        JOIN tutor_hijos th ON th.padre_id = p.id
+        WHERE th.hijo_id = $1 AND p.recibe_whatsapp = TRUE
+        LIMIT 1` // Traemos al primero configurado
+
+		err = db.QueryRow(queryPadre, hijoID).Scan(&padreID, &telefonoPadre)
+		if err != nil {
+			fmt.Println("Aviso: No se encontró tutor con WhatsApp activo:", err)
+		}
+		// -------------------------------------------------------
+
 		// 4. Manejo de MÚLTIPLES FOTOS
-		// Recogemos todos los archivos que vengan bajo la llave "fotos"
 		form, _ := c.MultipartForm()
 		files := form.File["fotos"]
-
 		var urlsSubidas []string
 
 		for _, file := range files {
-			// Generamos un nombre único para cada foto dentro de su carpeta
 			nombreArchivo := fmt.Sprintf("guarderia_%v/hijo_%s/%s_%s_%s",
 				gID, hijoID, fechaHoy, ahora.Format("150405"), file.Filename)
 
-			// Subimos a S3 usando tu función existente
 			url, errS3 := uploadToS3(file, nombreArchivo)
 			if errS3 != nil {
-				fmt.Printf("Error subiendo archivo %s a S3: %v\n", file.Filename, errS3)
-				continue // Si falla una foto, intentamos con la siguiente
+				continue
 			}
 
-			// 5. Insertamos la URL en la tabla de fotos vinculada al seguimientoID
 			_, errDBFoto := db.Exec("INSERT INTO fotos_seguimiento (seguimiento_id, url) VALUES ($1, $2)", seguimientoID, url)
-			if errDBFoto != nil {
-				fmt.Println("Error guardando URL en DB:", errDBFoto)
-			} else {
+			if errDBFoto == nil {
 				urlsSubidas = append(urlsSubidas, url)
 			}
 		}
 
+		// 5. Respuesta JSON
 		c.JSON(http.StatusOK, gin.H{
-			"mensaje":        "Información de bitácora y fotos guardadas correctamente",
+			"mensaje":        "Información guardada correctamente",
 			"seguimiento_id": seguimientoID,
 			"fotos_subidas":  len(urlsSubidas),
 			"urls":           urlsSubidas,
+			"padre_id":       padreID,
+			"telefono_padre": telefonoPadre,
 		})
 	})
 
@@ -1280,6 +1299,75 @@ func main() {
 		if err == nil {
 			defer rows.Close()
 			s.Fotos = []string{} // Inicializamos como array vacío para que no sea 'null' en JSON
+			for rows.Next() {
+				var url string
+				if err := rows.Scan(&url); err == nil {
+					s.Fotos = append(s.Fotos, url)
+				}
+			}
+		}
+
+		c.JSON(http.StatusOK, s)
+	})
+
+	// 1. Nota: Quitamos AuthMiddleware para que sea accesible vía link de WhatsApp
+	r.GET("/publico/seguimiento/:token", func(c *gin.Context) {
+		token := c.Param("token") // El UUID del niño
+		fechaConsulta := c.Query("fecha")
+
+		location, _ := time.LoadLocation("America/Mazatlan")
+		if fechaConsulta == "" {
+			fechaConsulta = time.Now().In(location).Format("2006-01-02")
+		}
+
+		type SeguimientoCompleto struct {
+			ID            int      `json:"id"`
+			HijoID        int      `json:"hijo_id"`
+			HijoNombre    string   `json:"hijo_nombre"` // Añadimos el nombre para la vista
+			Fecha         string   `json:"fecha"`
+			Desayuno      string   `json:"desayuno"`
+			Comida        string   `json:"comida"`
+			Merienda      string   `json:"merienda"`
+			Esfinter      string   `json:"esfinter"`
+			Observaciones string   `json:"observaciones"`
+			Durmio        bool     `json:"durmio"`
+			Fotos         []string `json:"fotos"`
+		}
+
+		var s SeguimientoCompleto
+
+		// 2. Nueva consulta: Unimos la tabla hijos con seguimiento_diario usando el token
+		querySeguimiento := `
+        SELECT 
+            s.id, s.hijo_id, h.nombre_niño, s.fecha, s.desayuno, 
+            s.comida, s.merienda, s.esfinter, s.observaciones, s.durmio 
+        FROM hijos h
+        JOIN seguimiento_diario s ON h.id = s.hijo_id
+        WHERE h.url_token = $1 AND s.fecha = $2`
+
+		err := db.QueryRow(querySeguimiento, token, fechaConsulta).Scan(
+			&s.ID, &s.HijoID, &s.HijoNombre, &s.Fecha, &s.Desayuno, &s.Comida,
+			&s.Merienda, &s.Esfinter, &s.Observaciones, &s.Durmio,
+		)
+
+		if err != nil {
+			// Si no hay bitácora, al menos intentamos traer el nombre del niño
+			// para que la pantalla no se vea vacía
+			var nombre string
+			db.QueryRow("SELECT nombre_niño FROM hijos WHERE url_token = $1", token).Scan(&nombre)
+
+			c.JSON(http.StatusNotFound, gin.H{
+				"hijo_nombre": nombre,
+				"error":       "Aún no hay reporte para la fecha seleccionada.",
+			})
+			return
+		}
+
+		// 3. Consulta de fotos (se mantiene igual)
+		rows, err := db.Query("SELECT url FROM fotos_seguimiento WHERE seguimiento_id = $1", s.ID)
+		if err == nil {
+			defer rows.Close()
+			s.Fotos = []string{}
 			for rows.Next() {
 				var url string
 				if err := rows.Scan(&url); err == nil {
